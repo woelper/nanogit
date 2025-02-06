@@ -1,0 +1,14 @@
+[package]
+name = "bait"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.95"
+eframe = "0.31.0"
+egui_extras = { version = "0.31.0", features = ["all_loaders"] }
+env_logger = "0.11.6"
+git2 = "0.20.0"
+log = "0.4.25"
+rfd = "0.15.2"
+# egui = "0.30.0"
