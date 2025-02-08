@@ -1,14 +1,29 @@
 [package]
-name = "bait"
-version = "0.1.0"
+name = "nanogit"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 anyhow = "1.0.95"
-eframe = "0.31.0"
-egui_extras = { version = "0.31.0", features = ["all_loaders"] }
+eframe = { version = "0.30.0", features = ["persistence"], optional = true }
+egui-notify = { version = "0.18.0", optional = true }
 env_logger = "0.11.6"
-git2 = "0.20.0"
 log = "0.4.25"
-rfd = "0.15.2"
-# egui = "0.30.0"
+rfd = { version = "0.15.2", optional = true }
+# basic-git = { version = "*", path = "./basic-git" }
+serde = { version = "1.0.217", features = ["derive"], optional = true }
+git2 = "0.20.0"
+
+[features]
+# The `gui` feature brings in the GUI dependencies
+# By default, you can either include "gui" or not:
+default = ["gui"] # means no features are enabled by default
+gui = [
+    "eframe",
+    "egui-notify",
+    "rfd",
+    "serde",
+] # add all optional GUI deps in here
+
+# If you want the GUI by default instead, do:
+# default = ["gui"]

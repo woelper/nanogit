@@ -1,85 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 #![allow(rustdoc::missing_crate_level_docs)] // it's an example
 
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-};
+use std::path::PathBuf;
 
-use eframe::egui;
-use git2::{Repository, Status, StatusOptions};
-use log::{error, info};
-
-struct FileStatus {
-    path: PathBuf,
-    status: Status,
-}
-
-struct RepoCache {
-    pub repo: Arc<Mutex<Repository>>,
-    statuses: Arc<Mutex<Vec<FileStatus>>>,
-}
-
-impl RepoCache {
-    pub fn open(path: &Path) -> Result<Self> {
-        let repo = Repository::open(path)?;
-        Ok(Self {
-            repo: Arc::new(Mutex::new(repo)),
-            statuses: Arc::new(Mutex::new(vec![])),
-        })
-    }
-
-    pub fn stage(&self, path: &Path) -> Result<()> {
-        let mut index = self.repo.lock().unwrap().index()?;
-        index.add_path(path)?;
-        index.write()?;
-        Ok(())
-    }
-
-    pub fn unstage(&self, path: &Path) -> Result<()> {
-        let mut index = self.repo.lock().unwrap().index()?;
-        index.remove_path(path)?;
-        index.write()?;
-        Ok(())
-    }
-
-    pub fn get_status(&self) -> Result<()> {
-        let repo = self.repo.clone();
-        let r_statuses = self.statuses.clone();
-
-        std::thread::spawn(move || {
-            let mut status_opts = StatusOptions::new();
-            status_opts
-                .include_untracked(true) // Show untracked files
-                .recurse_untracked_dirs(true); // Show untracked files within dirs
-
-            // Get the status of all files in the repo
-            // let statuses = repo.lock().unwrap().statuses(Some(&mut status_opts)).unwrap();
-            let binding = repo.lock().unwrap();
-            let statuses = binding.statuses(Some(&mut status_opts)).unwrap();
-
-            // Iterate through each file's status
-            r_statuses.lock().unwrap().clear();
-            for entry in statuses.iter() {
-                let path = entry.path().unwrap_or("<none>");
-                info!("{path}");
-                // You can check various bits in `status`:
-                // - INDEX_* for staged changes
-                // - WT_* for working tree changes (untracked, modified, etc.)
-                r_statuses.lock().unwrap().push(FileStatus {
-                    path: PathBuf::from(path),
-                    status: entry.status(),
-                });
-            }
-        });
-
-        Ok(())
-    }
-}
+use anyhow::{Context, Result};
+use eframe::egui::{self, Id, Response, Sense, Stroke, Ui, WidgetText};
+use egui_notify::Toasts;
+use log::info;
+use nanogit::{RepoCache, Status};
+use serde::{Deserialize, Serialize};
 
 fn main() -> eframe::Result {
     std::env::set_var("RUST_LOG", "debug");
-
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([320.0, 240.0]),
@@ -88,85 +20,260 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "bait",
         options,
-        Box::new(|cc| {
-            // This gives us image support:
-            egui_extras::install_image_loaders(&cc.egui_ctx);
-
-            Ok(Box::<MyApp>::default())
-        }),
+        Box::new(|cc| Ok(Box::new(GitApp::new(cc)))),
     )
 }
 
-struct MyApp {
+#[derive(Serialize, Deserialize)]
+
+struct GitApp {
+    #[serde(skip)]
     repo: Option<RepoCache>,
+    repo_root: Option<PathBuf>,
+    commit_message: String,
+    #[serde(skip)]
+    toasts: Toasts,
+    selected_file: Option<usize>,
 }
 
-impl Default for MyApp {
+impl Default for GitApp {
     fn default() -> Self {
-        Self { repo: None }
+        Self {
+            repo: None,
+            repo_root: None,
+            commit_message: Default::default(),
+            toasts: Toasts::default(),
+            selected_file: None,
+        }
     }
 }
 
-impl eframe::App for MyApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if ui.button("Load").clicked() {
-                match open_repo() {
-                    Ok(r) => {
-                        self.repo = Some(r);
-                    }
-                    Err(e) => error!("{e}"),
-                }
-            }
+impl GitApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        if let Some(storage) = cc.storage {
+            let mut state =
+                eframe::get_value::<GitApp>(storage, eframe::APP_KEY).unwrap_or_default();
+            info!("storage present {:?}", state.repo_root);
 
-            if let Some(repo) = self.repo.as_mut() {
-                if ui.button("Status").clicked() {
-                    let s = repo.get_status();
-                    info!("{:?}", s);
-                    _ = repo.get_status();
-                }
+            if let Some(root) = state.repo_root.as_ref() {
+                state.repo = RepoCache::open(&root).ok();
+                _ = state.repo.as_ref().map(|r| r.get_status());
+                return state;
             }
+        }
+        Self::default()
+    }
+}
+
+impl eframe::App for GitApp {
+    /// Called by the frame work to save state before shutdown.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        info!("Saved state {:?}", self.repo_root);
+
+        eframe::set_value(storage, eframe::APP_KEY, self);
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.toasts.show(ctx);
+
+        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open").clicked() {
+                        match open_repo() {
+                            Ok(r) => {
+                                self.repo = Some(r);
+
+                                let repo = self.repo.as_ref().expect("This repo must exist");
+
+                                if let Err(e) = repo.get_status() {
+                                    self.toasts.error(e.to_string());
+                                }
+
+                                self.repo_root =
+                                    Some(repo.repo.lock().unwrap().commondir().to_path_buf());
+                            }
+                            Err(e) => {
+                                self.toasts.error(format!("{e}"));
+                            }
+                        }
+                        ui.close_menu();
+                    }
+
+                    if let Some(repo) = self.repo.as_mut() {
+                        if ui.button("Refresh").clicked() {
+                            if let Err(e) = repo.get_status() {
+                                self.toasts.error(e.to_string());
+                            }
+                        }
+                    }
+                });
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // if let Some(repo) = self.repo.as_mut() {
+            //     if ui.button("Status").clicked() {
+            //         if let Err(e) = repo.get_status() {
+            //             self.toasts.error(e.to_string());
+            //         }
+            //     }
+            // }
 
             if let Some(repo) = &self.repo {
-                ui.label("Repo opened.");
-                egui::Grid::new("id_salt")
-                    .num_columns(2)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for s in &*repo.statuses.lock().unwrap() {
-                            ui.label(
-                                s.path
-                                    .file_name()
-                                    .map(|f| f.to_string_lossy().to_string())
-                                    .unwrap_or_default(),
-                            );
-                            ui.label(format!("{:?}", s.status));
-                            if s.status.is_index_new() {
-                                if ui.button("-").clicked() {
-                                    _ = repo.unstage(&s.path);
-                                    _ = repo.get_status();
-                                }
-                            }
-                            if s.status.is_wt_new() {
-                                if ui.button("+").clicked() {
-                                    _ = repo.stage(&s.path);
-                                    _ = repo.get_status();
-                                }
-                            }
+                ui.vertical_centered_justified(|ui| {
+                    let any_staged = repo.statuses.lock().unwrap().iter().any(|s| {
+                        s.status.is_index_deleted()
+                            || s.status.is_index_modified()
+                            || s.status.is_index_new()
+                            || s.status.is_index_renamed()
+                    });
 
-                            ui.end_row();
+                    ui.add_enabled_ui(any_staged, |ui| {
+                        egui::TextEdit::multiline(&mut self.commit_message)
+                            .desired_rows(1)
+                            .hint_text("Commit message")
+                            .desired_width(ui.available_width())
+                            .show(ui);
+
+                        ui.add_enabled_ui(!self.commit_message.is_empty(), |ui| {
+                            if ui.button("Commit").clicked() {
+                                match repo.commit() {
+                                    Ok(_) => self.commit_message.clear(),
+                                    Err(e) => {
+                                        self.toasts.error(format!("{e}"));
+                                    }
+                                }
+                            }
+                        });
+                    });
+                });
+
+                egui::CollapsingHeader::new("Changes")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for (i, status) in repo.statuses.lock().unwrap().iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let row_rect = ui.available_rect_before_wrap();
+
+                                if ui.rect_contains_pointer(row_rect) {
+                                    ui.painter().rect(
+                                        row_rect,
+                                        0.,
+                                        ui.style().visuals.widgets.hovered.bg_fill,
+                                        Stroke::NONE,
+                                    );
+                                }
+
+                                if ui.interact(row_rect, Id::new(i), Sense::click()).clicked() {
+                                    info!("Clicked {i}, selected {:?}", self.selected_file);
+                                    if Some(i) == self.selected_file {
+                                        self.selected_file = None;
+                                    } else {
+                                        self.selected_file = Some(i);
+                                        if let Ok(diff) = repo.diff(&status.path) {
+                                            info!("diff {diff}");
+                                            ui.ctx()
+                                                .data_mut(|w| w.insert_temp("diff".into(), diff));
+                                        }
+                                    }
+                                }
+
+                                if Some(i) == self.selected_file {
+                                    ui.painter().rect(
+                                        row_rect,
+                                        0.,
+                                        ui.style().visuals.widgets.active.bg_fill,
+                                        Stroke::NONE,
+                                    );
+                                }
+
+                                unselected_label(
+                                    status
+                                        .path
+                                        .file_name()
+                                        .map(|f| f.to_string_lossy().to_string())
+                                        .unwrap_or_default(),
+                                    ui,
+                                )
+                                .on_hover_text(format!("{:?}", status.status));
+
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        unselected_label(status_text(status.status), ui);
+
+                                        if ui
+                                            .interact(row_rect, Id::new(i), Sense::click_and_drag())
+                                            .hovered()
+                                        {
+                                            if status.status.is_index_new()
+                                                || status.status.is_index_modified()
+                                            {
+                                                if ui.button("-").clicked() {
+                                                    _ = repo.unstage(&status.path);
+                                                }
+                                            }
+
+                                            if status.status.is_wt_new()
+                                                || status.status.is_wt_modified()
+                                            {
+                                                if ui.button("+").clicked() {
+                                                    _ = repo.stage(&status.path);
+                                                }
+                                            }
+                                        }
+                                    },
+                                );
+
+                                ui.end_row();
+                            });
                         }
                     });
+
+                ui.collapsing("Diff", |ui| {
+                    if let Some(diff) = ui.ctx().data(|r| r.get_temp::<String>("diff".into())) {
+                        ui.label(diff);
+                    }
+                });
+                ui.collapsing("Log", |ui| {});
             }
         });
     }
 }
-
-use anyhow::{Context, Result};
 
 fn open_repo() -> Result<RepoCache> {
     let folder = rfd::FileDialog::new().pick_folder().context("No folder")?;
     info!("{}", folder.display());
     let repo = RepoCache::open(&folder)?;
     Ok(repo)
+}
+
+/// Just a helper for unselected labels
+fn unselected_label(text: impl Into<WidgetText>, ui: &mut Ui) -> Response {
+    ui.add(egui::Label::new(text).selectable(false))
+}
+
+fn status_text(status: Status) -> &'static str {
+    if status.is_conflicted() {
+        return "!";
+    }
+
+    if status.is_index_modified() || status.is_wt_modified() {
+        return "M";
+    }
+
+    if status.is_index_new() || status.is_wt_new() {
+        return "U";
+    }
+
+    if status.is_index_deleted() || status.is_wt_deleted() {
+        return "D";
+    }
+
+    if status.is_index_typechange() || status.is_wt_typechange() {
+        return "A";
+    }
+
+    "?"
 }
