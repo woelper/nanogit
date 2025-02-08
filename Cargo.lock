@@ -971,6 +971,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-phosphor"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebe75c81cd796bfb6718df8a5339c47695bfb33e400fae03a77200305519f2c2"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1008,6 +1017,15 @@ dependencies = [
  "web-time",
  "webbrowser",
  "winit",
+]
+
+[[package]]
+name = "egui_code_editor"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acbac4534ed7c619e1a253f7fce786864d261f026a581302b296343310b02c5d"
+dependencies = [
+ "egui",
 ]
 
 [[package]]
@@ -1969,6 +1987,8 @@ dependencies = [
  "anyhow",
  "eframe",
  "egui-notify",
+ "egui-phosphor",
+ "egui_code_editor",
  "env_logger",
  "git2",
  "log",

@@ -1,13 +1,10 @@
-
-
 pub use git2::{DiffFormat, DiffOptions, Repository, Signature, Sort, Status, StatusOptions};
-use log::info;
-
-
+use log::{debug, info};
 
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::SystemTime,
 };
 
 use anyhow::Result;
@@ -18,17 +15,56 @@ pub struct FileStatus {
     pub status: Status,
 }
 
+#[derive(Debug, Clone)]
+pub struct LogItem {
+    pub name: String,
+    pub email: String,
+    pub commit: String,
+    pub timestamp: i64,
+    pub message: String,
+}
+
 pub struct RepoCache {
     pub repo: Arc<Mutex<Repository>>,
     pub statuses: Arc<Mutex<Vec<FileStatus>>>,
+    pub log: Arc<Mutex<Vec<LogItem>>>,
+    pub local_refresh: Arc<Mutex<Option<SystemTime>>>,
+    pub remote_refresh: Arc<Mutex<Option<SystemTime>>>,
 }
 
 impl RepoCache {
+    pub fn get_local_refresh(&self) -> Option<SystemTime> {
+        self.local_refresh.lock().ok().map(|f| *f).flatten()
+    }
+
+    pub fn get_remote_refresh(&self) -> Option<SystemTime> {
+        self.remote_refresh.lock().ok().map(|f| *f).flatten()
+    }
+
+    pub fn is_local_refreshed(&self) -> bool {
+        self.local_refresh.lock().unwrap().is_some()
+    }
+
+    pub fn get_statuses(&self) -> Vec<FileStatus> {
+        (*self.statuses.lock().unwrap()).clone()
+    }
+
+    pub fn get_log(&self) -> Vec<LogItem> {
+        (*self.log.lock().unwrap()).clone()
+    }
+
+    pub fn get_root(&self) -> PathBuf {
+        self.repo.lock().unwrap().commondir().to_path_buf()
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let repo = Repository::open(path)?;
         Ok(Self {
             repo: Arc::new(Mutex::new(repo)),
             statuses: Arc::new(Mutex::new(vec![])),
+            log: Arc::new(Mutex::new(vec![])),
+            local_refresh: Arc::new(Mutex::new(None)),
+            remote_refresh: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -36,7 +72,7 @@ impl RepoCache {
         let mut index = self.repo.lock().unwrap().index()?;
         index.add_path(path)?;
         index.write()?;
-        self.get_status()?;
+        self.refresh()?;
         Ok(())
     }
 
@@ -44,79 +80,82 @@ impl RepoCache {
         let mut index = self.repo.lock().unwrap().index()?;
         index.remove_path(path)?;
         index.write()?;
-        self.get_status()?;
+        self.refresh()?;
         Ok(())
     }
 
-    pub fn get_log(&self) -> Result<()> {
+    pub fn refresh_log(&self, max_commits: usize) -> Result<Vec<LogItem>> {
         let repo = self.repo.lock().unwrap();
 
-        // 2. Get the HEAD reference and extract its OID (the commit hash)
-        let head = repo.head()?;
-        let head_oid = head.target().ok_or_else(|| {
-            git2::Error::from_str("HEAD reference was not a direct commit (detached HEAD?)")
-        })?;
 
-        // 3. Create a RevWalk, push HEAD, and choose sorting
         let mut revwalk = repo.revwalk()?;
-        revwalk.push(head_oid)?;
-        revwalk.set_sorting(Sort::TIME | Sort::REVERSE)?; // Oldest to newest by commit time
-
-        // 4. Iterate over each commit OID in the RevWalk
-        for oid_result in revwalk {
-            let oid = oid_result?;
-            let commit = repo.find_commit(oid)?;
-
-            // Retrieve commit metadata
+        revwalk.push_head()?;
+        // revwalk.set_sorting(Sort::TIME | Sort::REVERSE)?;
+        
+        let mut log = vec![];
+        for (i, oid) in revwalk.enumerate() {
+            if i >= max_commits { break; }
+            let commit = repo.find_commit(oid?)?;
             let author = commit.author();
-            let name = author.name().unwrap_or("Unknown");
-            let email = author.email().unwrap_or("unknown@example.com");
+            let name = author.name().unwrap_or("Unknown").to_string();
+            let email = author.email().unwrap_or("unknown@example.com").to_string();
             let timestamp = commit.time().seconds(); // Unix timestamp
-            let message = commit.message().unwrap_or("<no commit message>");
+            let message = commit
+                .message()
+                .unwrap_or("<no commit message>")
+                .to_string();
 
-            // Print information (roughly like `git log`)
-            println!("commit {}", commit.id());
-            println!("Author: {} <{}>", name, email);
-            // Convert the timestamp if you want a human-readable date
-            println!("Date:   {}", timestamp);
-            println!();
-            println!("    {}", message);
-            println!();
+            let logitem = LogItem {
+                name,
+                email,
+                timestamp,
+                message,
+                commit: commit.id().to_string(),
+            };
+
+            log.push(logitem);
         }
 
-        Ok(())
+
+        
+        // debug!("iterate");
+        // for oid_result in revwalk.take(max_commits) {
+        // debug!("res");
+
+        //     let oid = oid_result?;
+        //     let commit = repo.find_commit(oid)?;
+
+        //     // Retrieve commit metadata
+           
+
+        //     // // Print information (roughly like `git log`)
+        //     // println!("commit {}", commit.id());
+        //     // println!("Author: {} <{}>", name, email);
+        //     // // Convert the timestamp if you want a human-readable date
+        //     // println!("Date:   {}", timestamp);
+        //     // println!();
+        //     // println!("    {}", message);
+        //     // println!();
+        // }
+
+        Ok(log)
     }
 
     pub fn commit(&self) -> Result<()> {
-        // Open the repository in the current directory
-
         let repo = self.repo.lock().unwrap();
 
-        // Read the repo’s config
         let config = repo.config()?;
 
-        // Retrieve the user.name and user.email from the config
         let name = config.get_string("user.name")?;
         let email = config.get_string("user.email")?;
 
-        // 1. Get the current HEAD commit (the parent for our new commit)
-        //    and extract the reference
         let head_ref = repo.head()?;
         let parent_commit = head_ref.peel_to_commit()?;
 
-        // 2. Access the index (which contains the files you've staged)
         let mut index = repo.index()?;
-
-        // 3. Write the index to a tree and get the resulting tree ID
         let tree_id = index.write_tree()?;
-
-        // 4. Find the tree object in the repo
         let tree = repo.find_tree(tree_id)?;
-
-        // 5. Create a commit signature (author and committer)
-        //    You can customize name/email or pull from repo config
         let sig = Signature::now(&name, &email)?;
-
         // 6. Create the commit on HEAD, using the parent we found
         let commit_id = repo.commit(
             Some("HEAD"),          // point HEAD to our new commit
@@ -127,9 +166,9 @@ impl RepoCache {
             &[&parent_commit],     // parents
         )?;
 
-        println!("New commit created: {}", commit_id);
+        debug!("New commit created: {}", commit_id);
 
-        _ = self.get_status();
+        _ = self.refresh();
 
         Ok(())
     }
@@ -144,6 +183,8 @@ impl RepoCache {
 
         // Build DiffOptions to target the single file
         let mut diff_opts = DiffOptions::new();
+
+        diff_opts.minimal(true);
         diff_opts.pathspec(path);
 
         // 4. Generate the diff
@@ -159,9 +200,10 @@ impl RepoCache {
             // ...
 
             // Print the actual diff lines
-            print!("{}", String::from_utf8_lossy(line.content()));
+            
+            let output = format!("{} {}", line.origin(), String::from_utf8_lossy(line.content()));
 
-            result.push_str(&String::from_utf8_lossy(line.content()));
+            result.push_str(&output);
 
             // Returning `true` means "keep processing"
             true
@@ -173,9 +215,10 @@ impl RepoCache {
     /// Like git status. Caches the result internally
     /// so you can quickly access it again through Repository.statuses
     /// This function is threaded and does not return anything.
-    pub fn get_status(&self) -> Result<()> {
+    pub fn refresh(&self) -> Result<()> {
         let repo = self.repo.clone();
         let r_statuses = self.statuses.clone();
+        let local_refresh = self.local_refresh.clone();
 
         std::thread::spawn(move || {
             let mut status_opts = StatusOptions::new();
@@ -184,7 +227,6 @@ impl RepoCache {
                 .recurse_untracked_dirs(true); // Show untracked files within dirs
 
             // Get the status of all files in the repo
-            // let statuses = repo.lock().unwrap().statuses(Some(&mut status_opts)).unwrap();
             let binding = repo.lock().unwrap();
             let statuses = binding.statuses(Some(&mut status_opts)).unwrap();
 
@@ -192,16 +234,24 @@ impl RepoCache {
             r_statuses.lock().unwrap().clear();
             for entry in statuses.iter() {
                 let path = entry.path().unwrap_or("<none>");
-                info!("{path}");
-                // You can check various bits in `status`:
-                // - INDEX_* for staged changes
-                // - WT_* for working tree changes (untracked, modified, etc.)
+                // debug!("{path}");
                 r_statuses.lock().unwrap().push(FileStatus {
                     path: PathBuf::from(path),
                     status: entry.status(),
                 });
             }
+            debug!("Repository status refreshed.");
+            *local_refresh.lock().unwrap() = Some(SystemTime::now());
+
+
+
+
         });
+
+        // todo: thread
+
+        let log = self.refresh_log(10)?;
+        *self.log.lock().unwrap() = log;
 
         Ok(())
     }

@@ -13,6 +13,8 @@ rfd = { version = "0.15.2", optional = true }
 # basic-git = { version = "*", path = "./basic-git" }
 serde = { version = "1.0.217", features = ["derive"], optional = true }
 git2 = "0.20.0"
+egui-phosphor = "0.8.0"
+egui_code_editor = "0.2.11"
 
 [features]
 # The `gui` feature brings in the GUI dependencies
